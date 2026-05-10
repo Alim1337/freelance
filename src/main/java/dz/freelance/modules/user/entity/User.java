@@ -34,7 +34,7 @@ public class User {
 
     @Column(nullable = false)
     @Builder.Default
-    private boolean emailVerified = false;
+    private boolean emailVerified = true; // skip email verification in local dev
 
     @Column(nullable = false)
     @Builder.Default

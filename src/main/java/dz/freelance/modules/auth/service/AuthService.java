@@ -1,15 +1,11 @@
 package dz.freelance.modules.auth.service;
 
-import dz.freelance.modules.auth.dto.AuthDtos.*;
-import dz.freelance.modules.user.entity.User;
-import dz.freelance.modules.user.entity.User.*;
-import dz.freelance.modules.user.repository.UserRepository;
-import dz.freelance.shared.exception.AppException;
-import dz.freelance.shared.util.JwtUtil;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
+import java.security.SecureRandom;
+import java.time.LocalDateTime;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.http.HttpStatus;
 import org.springframework.mail.SimpleMailMessage;
 import org.springframework.mail.javamail.JavaMailSender;
@@ -19,8 +15,24 @@ import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.security.SecureRandom;
-import java.time.Duration;
+import dz.freelance.modules.auth.dto.AuthDtos.*;
+import dz.freelance.modules.auth.dto.AuthDtos.AuthResponse;
+import dz.freelance.modules.auth.dto.AuthDtos.ForgotPasswordRequest;
+import dz.freelance.modules.auth.dto.AuthDtos.LoginRequest;
+import dz.freelance.modules.auth.dto.AuthDtos.RefreshTokenRequest;
+import dz.freelance.modules.auth.dto.AuthDtos.RegisterRequest;
+import dz.freelance.modules.auth.dto.AuthDtos.ResendOtpRequest;
+import dz.freelance.modules.auth.dto.AuthDtos.ResetPasswordRequest;
+import dz.freelance.modules.auth.dto.AuthDtos.UserSummary;
+import dz.freelance.modules.auth.dto.AuthDtos.VerifyEmailRequest;
+import dz.freelance.modules.user.entity.User;
+import dz.freelance.modules.user.entity.User.ProviderType;
+import dz.freelance.modules.user.entity.User.UserRole;
+import dz.freelance.modules.user.repository.UserRepository;
+import dz.freelance.shared.exception.AppException;
+import dz.freelance.shared.util.JwtUtil;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
 @Service
@@ -31,7 +43,6 @@ public class AuthService {
     private final PasswordEncoder passwordEncoder;
     private final JwtUtil jwtUtil;
     private final AuthenticationManager authenticationManager;
-    private final StringRedisTemplate redis;
     private final JavaMailSender mailSender;
 
     @Value("${app.mail.from}")
@@ -39,6 +50,12 @@ public class AuthService {
 
     @Value("${app.otp.expiration-minutes:10}")
     private int otpExpirationMinutes;
+
+    // In-memory stores (replace Redis for local dev)
+    private final Map<String, OtpEntry> otpStore = new ConcurrentHashMap<>();
+    private final Map<String, String> refreshTokenStore = new ConcurrentHashMap<>();
+
+    private record OtpEntry(String otp, LocalDateTime expiry) {}
 
     // ── Register ──────────────────────────────────────────
 
@@ -67,10 +84,11 @@ public class AuthService {
 
         userRepository.save(user);
 
-        sendOtpEmail(user.getEmail(), "verify");
+        // TODO: re-enable when mail is configured
+        // sendOtpEmail(user.getEmail(), "verify");
 
         log.info("Nouvel utilisateur enregistré: {} ({})", user.getEmail(), user.getRole());
-        return "Inscription réussie. Vérifiez votre email pour activer votre compte.";
+        return "Inscription réussie. Vous pouvez maintenant vous connecter.";
     }
 
     // ── Login ─────────────────────────────────────────────
@@ -83,9 +101,10 @@ public class AuthService {
         User user = userRepository.findByEmail(req.getEmail().toLowerCase())
             .orElseThrow(() -> new AppException("Utilisateur introuvable", HttpStatus.NOT_FOUND));
 
-        if (!user.isEmailVerified()) {
-            throw new AppException("Veuillez vérifier votre email avant de vous connecter", HttpStatus.FORBIDDEN);
-        }
+        // TODO: re-enable when email verification flow is ready
+        // if (!user.isEmailVerified()) {
+        //     throw new AppException("Veuillez vérifier votre email avant de vous connecter", HttpStatus.FORBIDDEN);
+        // }
 
         if (!user.isActive()) {
             throw new AppException("Votre compte a été suspendu. Contactez le support.", HttpStatus.FORBIDDEN);
@@ -100,12 +119,7 @@ public class AuthService {
         String accessToken = jwtUtil.generateAccessToken(userDetails, user.getId(), user.getRole().name());
         String refreshToken = jwtUtil.generateRefreshToken(userDetails);
 
-        // Stocker le refresh token dans Redis
-        redis.opsForValue().set(
-            "refresh:" + user.getId(),
-            refreshToken,
-            Duration.ofDays(7)
-        );
+        refreshTokenStore.put(String.valueOf(user.getId()), refreshToken);
 
         return AuthResponse.builder()
             .accessToken(accessToken)
@@ -119,9 +133,9 @@ public class AuthService {
     @Transactional
     public String verifyEmail(VerifyEmailRequest req) {
         String key = "otp:verify:" + req.getEmail().toLowerCase();
-        String stored = redis.opsForValue().get(key);
+        OtpEntry entry = otpStore.get(key);
 
-        if (stored == null || !stored.equals(req.getOtp())) {
+        if (entry == null || !entry.otp().equals(req.getOtp()) || entry.expiry().isBefore(LocalDateTime.now())) {
             throw new AppException("Code OTP invalide ou expiré", HttpStatus.BAD_REQUEST);
         }
 
@@ -130,7 +144,7 @@ public class AuthService {
 
         user.setEmailVerified(true);
         userRepository.save(user);
-        redis.delete(key);
+        otpStore.remove(key);
 
         log.info("Email vérifié: {}", user.getEmail());
         return "Email vérifié avec succès. Vous pouvez maintenant vous connecter.";
@@ -153,7 +167,7 @@ public class AuthService {
         User user = userRepository.findByEmail(email)
             .orElseThrow(() -> new AppException("Token invalide", HttpStatus.UNAUTHORIZED));
 
-        String stored = redis.opsForValue().get("refresh:" + user.getId());
+        String stored = refreshTokenStore.get(String.valueOf(user.getId()));
         if (stored == null || !stored.equals(req.getRefreshToken())) {
             throw new AppException("Refresh token invalide ou expiré", HttpStatus.UNAUTHORIZED);
         }
@@ -167,7 +181,7 @@ public class AuthService {
         String newAccess = jwtUtil.generateAccessToken(userDetails, user.getId(), user.getRole().name());
         String newRefresh = jwtUtil.generateRefreshToken(userDetails);
 
-        redis.opsForValue().set("refresh:" + user.getId(), newRefresh, Duration.ofDays(7));
+        refreshTokenStore.put(String.valueOf(user.getId()), newRefresh);
 
         return AuthResponse.builder()
             .accessToken(newAccess)
@@ -188,9 +202,9 @@ public class AuthService {
     @Transactional
     public String resetPassword(ResetPasswordRequest req) {
         String key = "otp:reset:" + req.getEmail().toLowerCase();
-        String stored = redis.opsForValue().get(key);
+        OtpEntry entry = otpStore.get(key);
 
-        if (stored == null || !stored.equals(req.getOtp())) {
+        if (entry == null || !entry.otp().equals(req.getOtp()) || entry.expiry().isBefore(LocalDateTime.now())) {
             throw new AppException("Code OTP invalide ou expiré", HttpStatus.BAD_REQUEST);
         }
 
@@ -199,8 +213,8 @@ public class AuthService {
 
         user.setPassword(passwordEncoder.encode(req.getNewPassword()));
         userRepository.save(user);
-        redis.delete(key);
-        redis.delete("refresh:" + user.getId());
+        otpStore.remove(key);
+        refreshTokenStore.remove(String.valueOf(user.getId()));
 
         return "Mot de passe réinitialisé avec succès.";
     }
@@ -208,7 +222,7 @@ public class AuthService {
     // ── Logout ────────────────────────────────────────────
 
     public void logout(String userId) {
-        redis.delete("refresh:" + userId);
+        refreshTokenStore.remove(userId);
     }
 
     // ── Helpers ───────────────────────────────────────────
@@ -216,9 +230,11 @@ public class AuthService {
     private void sendOtpEmail(String email, String type) {
         String otp = generateOtp();
         String key = "otp:" + type + ":" + email;
-        redis.opsForValue().set(key, otp, Duration.ofMinutes(otpExpirationMinutes));
+        otpStore.put(key, new OtpEntry(otp, LocalDateTime.now().plusMinutes(otpExpirationMinutes)));
 
-        String subject = type.equals("verify") ? "Vérification de votre email — Freelance DZ" : "Réinitialisation de mot de passe — Freelance DZ";
+        String subject = type.equals("verify")
+            ? "Vérification de votre email — Freelance DZ"
+            : "Réinitialisation de mot de passe — Freelance DZ";
         String body = type.equals("verify")
             ? "Bonjour,\n\nVotre code de vérification est : " + otp + "\n\nCe code expire dans " + otpExpirationMinutes + " minutes."
             : "Bonjour,\n\nVotre code de réinitialisation est : " + otp + "\n\nCe code expire dans " + otpExpirationMinutes + " minutes.";
